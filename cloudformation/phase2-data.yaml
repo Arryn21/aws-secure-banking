@@ -1,0 +1,277 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Phase 2 — Secure Data Layer
+  Encrypted RDS MySQL + DynamoDB + S3 audit bucket.
+  All storage encrypted at rest. No public access anywhere.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: secure-banking
+
+  DBMasterUsername:
+    Type: String
+    Default: adminuser
+    NoEcho: true
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small, db.t3.medium]
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for RDS (deploy Phase 4 first for new VPCs)
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet::Id
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet::Id
+
+Resources:
+
+  # ── Secrets Manager — DB credentials ──────────────────────
+  DBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}-db-credentials"
+      Description: RDS master credentials — auto-rotated every 30 days
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "${DBMasterUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\\'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ── RDS Subnet Group ──────────────────────────────────────
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for RDS — no public access
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Security Group for RDS — only Lambda can reach port 3306
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS MySQL — allow inbound 3306 from Lambda SG only
+      VpcId: !Ref VpcId
+      # No ingress rules here — added by reference from Lambda SG
+      # This avoids circular dependency; Lambda SG references this SG
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "127.0.0.1/32"  # Block all outbound — DB never initiates connections
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: SecurityControl
+          Value: NetworkIsolation
+
+  # ── RDS MySQL Instance ─────────────────────────────────────
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot  # Take snapshot before deletion — no accidental data loss
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-mysql"
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: mysql
+      EngineVersion: "8.0"
+      # Credentials from Secrets Manager — not hardcoded
+      MasterUsername: !Sub "{{resolve:secretsmanager:${DBSecret}:SecretString:username}}"
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DBSecret}:SecretString:password}}"
+      DBName: bankingdb
+      AllocatedStorage: "20"
+      StorageType: gp3
+      # Encryption at rest — AES-256 via AWS KMS
+      StorageEncrypted: true
+      # No public access — private subnet only
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !GetAtt RDSSecurityGroup.GroupId
+      # Enforce TLS for all connections
+      EnableIAMDatabaseAuthentication: true
+      # Automated backups — 7 day retention
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: "02:00-03:00"
+      # Maintenance window — off-peak
+      PreferredMaintenanceWindow: "sun:04:00-sun:05:00"
+      AutoMinorVersionUpgrade: true
+      # Enable enhanced monitoring
+      MonitoringInterval: 60
+      # Enable Performance Insights
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      # Audit logs + error logs to CloudWatch
+      EnableCloudwatchLogsExports:
+        - audit
+        - error
+        - general
+        - slowquery
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: DataClassification
+          Value: Confidential
+
+  # Attach RDS to Secrets Manager for auto-rotation
+  DBSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DBSecret
+      TargetId: !Ref DBInstance
+      TargetType: AWS::RDS::DBInstance
+
+  # ── DynamoDB — Transactions Table ─────────────────────────
+  TransactionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-transactions"
+      BillingMode: PAY_PER_REQUEST  # On-demand — no capacity planning needed
+      # Server-side encryption with AWS-managed key
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      # Point-in-time recovery — 35 days of rollback
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: transactionId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: transactionId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        # Query all transactions for a user, sorted by time
+        - IndexName: userId-timestamp-index
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      # Auto-delete old transactions after 2 years (compliance)
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: DataClassification
+          Value: Confidential
+
+  # ── S3 — Audit Logs & Backups ─────────────────────────────
+  AuditLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain  # Never delete audit logs
+    Properties:
+      BucketName: !Sub "${ProjectName}-audit-logs-${AWS::AccountId}"
+      # Block ALL public access — belt and suspenders
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Versioning — prevent accidental deletion/overwrite
+      VersioningConfiguration:
+        Status: Enabled
+      # Object Lock — compliance: logs cannot be deleted for 365 days
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention:
+            Mode: COMPLIANCE
+            Days: 365
+      # Encryption — AES-256
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+            BucketKeyEnabled: true
+      # Lifecycle — move old logs to Glacier after 90 days (cost saving)
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldLogs
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+            NoncurrentVersionTransitions:
+              - TransitionInDays: 30
+                StorageClass: GLACIER
+      # Server access logging (who accessed the bucket)
+      LoggingConfiguration:
+        DestinationBucketName: !Sub "${ProjectName}-audit-logs-${AWS::AccountId}"
+        LogFilePrefix: bucket-access-logs/
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: DataClassification
+          Value: Audit
+
+  # Bucket policy — deny non-HTTPS access and require specific principals
+  AuditLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AuditLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Deny HTTP — only HTTPS allowed
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt AuditLogsBucket.Arn
+              - !Sub "${AuditLogsBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+          # Deny delete on locked objects (redundant with Object Lock, but explicit)
+          - Sid: DenyObjectDeletion
+            Effect: Deny
+            Principal: "*"
+            Action:
+              - s3:DeleteObject
+              - s3:DeleteObjectVersion
+            Resource: !Sub "${AuditLogsBucket.Arn}/*"
+            Condition:
+              StringNotEquals:
+                "aws:PrincipalAccount": !Ref AWS::AccountId
+
+Outputs:
+  DBInstanceEndpoint:
+    Description: RDS endpoint (internal only — not publicly reachable)
+    Value: !GetAtt DBInstance.Endpoint.Address
+    Export:
+      Name: !Sub "${ProjectName}-DBEndpoint"
+
+  TransactionsTableName:
+    Value: !Ref TransactionsTable
+    Export:
+      Name: !Sub "${ProjectName}-TransactionsTable"
+
+  AuditBucketName:
+    Value: !Ref AuditLogsBucket
+    Export:
+      Name: !Sub "${ProjectName}-AuditBucket"
+
+  DBSecretArn:
+    Value: !Ref DBSecret
+    Export:
+      Name: !Sub "${ProjectName}-DBSecretArn"

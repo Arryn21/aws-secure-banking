@@ -1,0 +1,313 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Phase 5 — Monitoring & Detection
+  CloudTrail (all regions) + CloudWatch alarms for security events
+  + GuardDuty + AWS Config CIS rules + SNS alerting.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: secure-banking
+
+  AlertEmail:
+    Type: String
+    Description: Email address to receive security alerts
+    AllowedPattern: "^[\\w-\\+]+(\\.[\\w]+)*@[\\w-]+(\\.[\\w]+)*(\\.[a-z]{2,})$"
+
+  AuditBucketName:
+    Type: String
+    Description: S3 bucket for CloudTrail logs (from Phase 2 output)
+
+Resources:
+
+  # ── SNS Topic — Security Alerts ────────────────────────────
+  SecurityAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-security-alerts"
+      DisplayName: "Banking Security Alert"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ── CloudTrail — Multi-region, all API calls ───────────────
+  CloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      TrailName: !Sub "${ProjectName}-audit-trail"
+      S3BucketName: !Ref AuditBucketName
+      S3KeyPrefix: cloudtrail
+      IsLogging: true
+      # Multi-region — catches activity in ALL regions (not just deployed region)
+      IsMultiRegionTrail: true
+      # Log global service events (IAM, STS)
+      IncludeGlobalServiceEvents: true
+      # Log file integrity validation — detects if logs are tampered with
+      EnableLogFileValidation: true
+      # Log data events — S3 object-level + Lambda invocations
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: AWS::S3::Object
+              Values:
+                - !Sub "arn:aws:s3:::${AuditBucketName}/"
+            - Type: AWS::Lambda::Function
+              Values:
+                - "arn:aws:lambda"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Group for CloudTrail
+  CloudTrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "${ProjectName}-cloudtrail"
+      RetentionInDays: 90
+
+  # ── CloudWatch Alarms — Security Events ───────────────────
+
+  # ALARM 1: Root account login
+  RootLoginAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-root-login"
+      AlarmDescription: "CRITICAL: Root account was used to log in"
+      MetricName: RootAccountUsageEventCount
+      Namespace: CloudTrailMetrics
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SecurityAlertTopic
+
+  # ALARM 2: IAM policy changes
+  IAMPolicyChangeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-iam-policy-change"
+      AlarmDescription: "WARNING: IAM policy/role was created, modified, or deleted"
+      MetricName: IAMPolicyEventCount
+      Namespace: CloudTrailMetrics
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SecurityAlertTopic
+
+  # ALARM 3: Failed console logins (brute force signal)
+  FailedLoginAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-failed-console-login"
+      AlarmDescription: "WARNING: Multiple failed console login attempts detected"
+      MetricName: ConsoleLoginFailures
+      Namespace: CloudTrailMetrics
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SecurityAlertTopic
+
+  # ALARM 4: Security Group changes
+  SecurityGroupChangeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-sg-change"
+      AlarmDescription: "WARNING: Security Group was modified — possible firewall bypass"
+      MetricName: SecurityGroupEventCount
+      Namespace: CloudTrailMetrics
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SecurityAlertTopic
+
+  # ALARM 5: CloudTrail disabled (attacker covering tracks)
+  CloudTrailDisabledAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-cloudtrail-disabled"
+      AlarmDescription: "CRITICAL: CloudTrail was stopped — possible attacker covering tracks"
+      MetricName: CloudTrailEventCount
+      Namespace: CloudTrailMetrics
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SecurityAlertTopic
+
+  # ALARM 6: Unusual Lambda invocation spike
+  LambdaSpikeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-lambda-invocation-spike"
+      AlarmDescription: "WARNING: Unusual Lambda invocation count — possible abuse"
+      MetricName: Invocations
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SecurityAlertTopic
+
+  # ── GuardDuty ──────────────────────────────────────────────
+  GuardDutyDetector:
+    Type: AWS::GuardDuty::Detector
+    Properties:
+      Enable: true
+      # 15-minute update frequency for threat intelligence
+      FindingPublishingFrequency: FIFTEEN_MINUTES
+      Features:
+        # S3 protection — detect malicious S3 API usage
+        - Name: S3_DATA_EVENTS
+          Status: ENABLED
+        # EKS audit logs (future-proofing)
+        - Name: EKS_AUDIT_LOGS
+          Status: ENABLED
+        # Malware protection on EC2 (if added later)
+        - Name: EBS_MALWARE_PROTECTION
+          Status: ENABLED
+
+  # SNS notification for high-severity GuardDuty findings
+  GuardDutyEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-guardduty-findings"
+      Description: "Route high-severity GuardDuty findings to SNS"
+      EventPattern:
+        source:
+          - "aws.guardduty"
+        detail-type:
+          - "GuardDuty Finding"
+        detail:
+          severity:
+            - 7    # High
+            - 8
+            - 9
+            - 10
+      State: ENABLED
+      Targets:
+        - Arn: !Ref SecurityAlertTopic
+          Id: SecurityAlertSNS
+
+  # Allow EventBridge to publish to SNS
+  SNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref SecurityAlertTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref SecurityAlertTopic
+
+  # ── AWS Config — CIS Benchmark Rules ──────────────────────
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      Name: !Sub "${ProjectName}-config-recorder"
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Properties:
+      S3BucketName: !Ref AuditBucketName
+      S3KeyPrefix: config
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: Six_Hours
+
+  # CIS Rule: MFA on root account
+  RootMFARule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub "${ProjectName}-root-mfa-enabled"
+      Description: "CIS 1.5 — Root account must have MFA enabled"
+      Source:
+        Owner: AWS
+        SourceIdentifier: ROOT_ACCOUNT_MFA_ENABLED
+
+  # CIS Rule: No root access keys
+  RootAccessKeyRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub "${ProjectName}-no-root-access-keys"
+      Description: "CIS 1.4 — Root account must not have access keys"
+      Source:
+        Owner: AWS
+        SourceIdentifier: IAM_ROOT_ACCESS_KEY_CHECK
+
+  # CIS Rule: S3 buckets not public
+  S3PublicAccessRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub "${ProjectName}-s3-no-public-access"
+      Description: "CIS 2.1.5 — S3 buckets must not allow public access"
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_LEVEL_PUBLIC_ACCESS_PROHIBITED
+
+  # CIS Rule: EBS encryption by default
+  EBSEncryptionRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub "${ProjectName}-ebs-encryption"
+      Description: "CIS 2.2.1 — EBS volumes must be encrypted"
+      Source:
+        Owner: AWS
+        SourceIdentifier: EC2_EBS_ENCRYPTION_BY_DEFAULT
+
+  # CIS Rule: CloudTrail enabled in all regions
+  CloudTrailEnabledRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub "${ProjectName}-cloudtrail-enabled"
+      Description: "CIS 3.1 — CloudTrail must be enabled in all regions"
+      Source:
+        Owner: AWS
+        SourceIdentifier: MULTI_REGION_CLOUD_TRAIL_ENABLED
+
+Outputs:
+  SecurityAlertTopicArn:
+    Description: SNS topic for security alerts
+    Value: !Ref SecurityAlertTopic
+    Export:
+      Name: !Sub "${ProjectName}-SecurityAlertTopic"
+
+  GuardDutyDetectorId:
+    Value: !Ref GuardDutyDetector
+    Export:
+      Name: !Sub "${ProjectName}-GuardDutyDetectorId"

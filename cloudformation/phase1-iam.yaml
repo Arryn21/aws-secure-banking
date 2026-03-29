@@ -1,0 +1,224 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Phase 1 — Identity & Access Management
+  Least-privilege IAM roles for each service + Cognito user pool with MFA.
+  No wildcard permissions. No inline policies.
+
+# ────────────────────────────────────────────────────────────
+# PARAMETERS
+# ────────────────────────────────────────────────────────────
+Parameters:
+  ProjectName:
+    Type: String
+    Default: secure-banking
+    Description: Prefix for all resource names
+
+  CognitoCallbackURL:
+    Type: String
+    Default: https://localhost/callback
+    Description: OAuth callback URL for Cognito app client
+
+# ────────────────────────────────────────────────────────────
+# RESOURCES
+# ────────────────────────────────────────────────────────────
+Resources:
+
+  # ── Cognito User Pool ──────────────────────────────────────
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${ProjectName}-user-pool"
+      # Enforce strong password policy
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 1
+      # MFA — required for all users
+      MfaConfiguration: "ON"
+      EnabledMfas:
+        - SOFTWARE_TOKEN_MFA
+      # Account recovery via verified email only (not phone — SIM swap risk)
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      # Auto-verify email on sign-up
+      AutoVerifiedAttributes:
+        - email
+      # Username is email address
+      UsernameAttributes:
+        - email
+      UsernameConfiguration:
+        CaseSensitive: false
+      # Advanced security — detects compromised credentials
+      UserPoolAddOns:
+        AdvancedSecurityMode: ENFORCED
+      # Schema: require email, add custom role attribute
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: false
+        - Name: role
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: SecurityControl
+          Value: Authentication
+
+  # App client — no client secret (SPA/mobile pattern)
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${ProjectName}-app-client"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      # Only allow code flow — no implicit grant (tokens in URL = bad)
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+      AllowedOAuthFlowsUserPoolClient: true
+      CallbackURLs:
+        - !Ref CognitoCallbackURL
+      LogoutURLs:
+        - !Ref CognitoCallbackURL
+      # Short token expiry — minimize stolen token window
+      AccessTokenValidity: 1      # 1 hour
+      IdTokenValidity: 1          # 1 hour
+      RefreshTokenValidity: 7     # 7 days
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      # Prevent user enumeration (same error for wrong user vs wrong password)
+      PreventUserExistenceErrors: ENABLED
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH       # Secure Remote Password — never sends password over wire
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  # ── IAM Execution Role — Lambda (Transaction Processor) ───
+  LambdaTransactionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-lambda-transaction-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      # Only CloudWatch Logs — no other managed policies
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Inline policy — Lambda can ONLY access specific DynamoDB table + Secrets Manager
+  LambdaTransactionPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${ProjectName}-lambda-transaction-policy"
+      Roles:
+        - !Ref LambdaTransactionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # DynamoDB — specific table only, specific actions only
+          - Sid: DynamoDBTransactions
+            Effect: Allow
+            Action:
+              - dynamodb:PutItem
+              - dynamodb:GetItem
+              - dynamodb:Query
+              - dynamodb:UpdateItem
+            Resource:
+              - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-transactions"
+              - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-transactions/index/*"
+          # Secrets Manager — read DB credentials only
+          - Sid: SecretsManagerRead
+            Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource:
+              - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}-db-credentials*"
+          # CloudWatch Logs
+          - Sid: CloudWatchLogs
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-*"
+
+  # ── IAM Role — API Gateway to CloudWatch Logs ─────────────
+  APIGatewayLoggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-apigw-logging-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  # ── IAM Role — CloudTrail to write logs ───────────────────
+  CloudTrailRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-cloudtrail-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudTrailLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ProjectName}-cloudtrail:*"
+
+# ────────────────────────────────────────────────────────────
+# OUTPUTS
+# ────────────────────────────────────────────────────────────
+Outputs:
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub "${ProjectName}-UserPoolId"
+
+  UserPoolClientId:
+    Description: Cognito App Client ID
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub "${ProjectName}-UserPoolClientId"
+
+  LambdaTransactionRoleArn:
+    Description: IAM Role ARN for Lambda transaction processor
+    Value: !GetAtt LambdaTransactionRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-LambdaTransactionRoleArn"

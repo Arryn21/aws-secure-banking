@@ -38,7 +38,7 @@ Each phase is independently deployable. Each component has a documented threat m
 │  │  │  RDS (MySQL) │          │  DynamoDB (Transactions)│    │  │
 │  │  │  Encrypted   │          │  Encrypted + On-demand  │    │  │
 │  │  └──────────────┘          └─────────────────────────┘    │  │
-│  └────────────────────────────────────────────────────────────┘ │
+│  └───────────────────────────────────────────────────────────┘  │
 │                                                                 │
 │  ┌──────────────────────────────────────────────────────────┐   │
 │  │              Monitoring & Security Layer                 │   │
